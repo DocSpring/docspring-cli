@@ -1,0 +1,89 @@
+# Notarizes the macOS binaries with Apple. release.yml runs it after the binaries are built and signed, and publishes
+# the release only once it passes. Without notarization, macOS refuses to run a binary that was downloaded in a browser
+# ("Apple could not verify..."). A bare binary can't carry its notarization ticket (only apps, disk images and
+# installer packages can be stapled), so macOS looks the ticket up online, by the binary's code hash, the first time it
+# runs. Nothing here changes the archives.
+#
+# It signs in to Apple's notary service with an App Store Connect API key: the APPLE_NOTARY_KEY (the .p8 file's text),
+# APPLE_NOTARY_KEY_ID and APPLE_NOTARY_ISSUER_ID secrets (internal_docs/sdk-generation.md in DocSpring's monorepo).
+name: Notarize the macOS binaries
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  notarize:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Fetch the macOS builds
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: artifacts-build-local-*-apple-darwin
+          path: builds/
+          merge-multiple: true
+      - name: Notarize
+        env:
+          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          for name in APPLE_NOTARY_KEY APPLE_NOTARY_KEY_ID APPLE_NOTARY_ISSUER_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error::The $name secret isn't set on this repository"
+              exit 1
+            fi
+          done
+
+          shopt -s nullglob
+          archives=(builds/docspring-cli-*-apple-darwin.tar.xz)
+          if [ ${#archives[@]} -eq 0 ]; then
+            echo "::error::No macOS archives in builds/: $(ls builds)"
+            exit 1
+          fi
+
+          # One submission with every macOS binary, each in a folder named after its target
+          mkdir -p notarize
+          for archive in "${archives[@]}"; do
+            target=$(basename "$archive" .tar.xz)
+            target=${target#docspring-cli-}
+            mkdir -p "extracted/$target" "notarize/$target"
+            tar -xJf "$archive" -C "extracted/$target"
+            binary="extracted/$target/docspring-cli-$target/docspring"
+            codesign --verify --strict --verbose=2 "$binary"
+            # Apple refuses a binary without the hardened runtime (build-setup.yml asks dist's codesign for it)
+            if ! codesign --display --verbose=2 "$binary" 2>&1 | grep -q '^CodeDirectory .*flags=0x[0-9a-f]*([^)]*runtime'; then
+              echo "::error::$archive's binary isn't signed with the hardened runtime:"
+              codesign --display --verbose=2 "$binary"
+              exit 1
+            fi
+            cp "$binary" "notarize/$target/docspring"
+          done
+          ditto -c -k --keepParent notarize notarize.zip
+
+          key="$RUNNER_TEMP/notary_key.p8"
+          printf '%s\n' "$APPLE_NOTARY_KEY" > "$key"
+          auth=(--key "$key" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID")
+
+          # notarytool's exit status alone doesn't say whether Apple accepted the binaries: the submission's status does
+          set +e
+          xcrun notarytool submit notarize.zip "${auth[@]}" --wait --timeout 1h --output-format json > submission.json
+          submit_status=$?
+          set -e
+          cat submission.json
+          id=$(jq -r '.id // empty' submission.json)
+          status=$(jq -r '.status // empty' submission.json)
+          if [ -n "$id" ]; then
+            # Apple's report: lists any problems, and warnings even when it accepts the binaries
+            xcrun notarytool log "$id" "${auth[@]}"
+          fi
+          if [ "$status" != Accepted ]; then
+            echo "::error::Apple didn't notarize the binaries (notarytool exited $submit_status, status: ${status:-none}). Its report above says why."
+            exit 1
+          fi
+          echo "Notarized: ${archives[*]}"

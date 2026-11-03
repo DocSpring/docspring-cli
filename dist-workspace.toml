@@ -11,9 +11,11 @@ installers = ["shell", "powershell", "homebrew"]
 tap = "DocSpring/homebrew-tap"
 formula = "docspring"
 publish-jobs = ["homebrew", "./publish-crates"]
-# A custom publish job gets only id-token and packages unless this says otherwise, and publish-crates.yml checks out
-# the repository; a called workflow can't ask for more than its caller grants
-github-custom-job-permissions = { "publish-crates" = { contents = "read", id-token = "write" } }
+# Notarizes the macOS binaries after they're built (.github/workflows/notarize.yml): the release is published only
+# once Apple accepts them
+global-artifacts-jobs = ["./notarize"]
+# Steps each build job runs before `dist build`: the hardened runtime for the macOS signatures, which notarization needs
+github-build-setup = "../build-setup.yml"
 # Linux builds use musl, so they run on any distribution
 targets = [
   "aarch64-apple-darwin",
@@ -29,9 +31,17 @@ install-updater = false
 checksum = "sha256"
 github-attestations = true
 # Signs the macOS binaries with DocSpring's Developer ID (CODESIGN_* secrets in the docspring-cli repo,
-# internal_docs/sdk-generation.md), so the keychain keeps trusting the CLI after each update
+# internal_docs/sdk-generation.md), so the keychain keeps trusting the CLI after each update. notarize.yml then
+# notarizes them.
 macos-sign = true
 pr-run-mode = "plan"
+
+# A custom publish job gets only id-token and packages unless this says otherwise, and publish-crates.yml checks out
+# the repository; a called workflow can't ask for more than its caller grants. Without an entry, notarize would get
+# the workflow's own contents: write.
+[dist.github-custom-job-permissions]
+"publish-crates" = { contents = "read", id-token = "write" }
+"notarize" = { contents = "read" }
 
 # Every action in release.yml pinned to a commit, with its version in a comment (the comment goes into the workflow
 # as written): the same commits as the SDKs' release workflows (api_clients/github_workflows/), which

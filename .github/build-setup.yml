@@ -1,0 +1,8 @@
+# Steps that dist's release.yml runs in each build job before `dist build` (github-build-setup in dist-workspace.toml).
+# This file sits outside workflows/, where GitHub would read it as a broken workflow.
+
+# Apple notarizes only binaries signed with the hardened runtime (notarize.yml). dist passes CODESIGN_OPTIONS to
+# codesign's --options when it signs the macOS binaries.
+- name: Sign macOS binaries with the hardened runtime
+  if: runner.os == 'macOS'
+  run: echo "CODESIGN_OPTIONS=runtime" >> "$GITHUB_ENV"

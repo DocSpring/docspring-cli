@@ -1,0 +1,77 @@
+# Installs the DocSpring CLI in a GitHub Actions job:
+#
+#   - uses: DocSpring/docspring-cli@v1
+#   - run: docspring submit tpl_1234567890abcdef01 --data @data.json -o filled.pdf
+#     env:
+#       DOCSPRING_TOKEN_ID: ${{ secrets.DOCSPRING_TOKEN_ID }}
+#       DOCSPRING_TOKEN_SECRET: ${{ secrets.DOCSPRING_TOKEN_SECRET }}
+name: Set up the DocSpring CLI
+description: Installs DocSpring's command-line interface (docspring) and puts it on the PATH
+author: DocSpring
+branding:
+  icon: file-text
+  color: blue
+inputs:
+  version:
+    description: >-
+      The version to install, such as 1.2.0, or latest. Default this action's own release, so
+      DocSpring/docspring-cli@v1 installs the newest 1.x.
+    required: false
+    default: "1.0.0-rc.1"
+outputs:
+  version:
+    description: The version that was installed
+    value: ${{ steps.install.outputs.version }}
+runs:
+  using: composite
+  steps:
+    - id: install
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        RUNNER_OS_NAME: ${{ runner.os }}
+        RUNNER_ARCH_NAME: ${{ runner.arch }}
+      run: |
+        set -euo pipefail
+        case "$RUNNER_OS_NAME/$RUNNER_ARCH_NAME" in
+          Linux/X64) target=x86_64-unknown-linux-musl ;;
+          Linux/ARM64) target=aarch64-unknown-linux-musl ;;
+          macOS/X64) target=x86_64-apple-darwin ;;
+          macOS/ARM64) target=aarch64-apple-darwin ;;
+          Windows/X64) target=x86_64-pc-windows-msvc ;;
+          Windows/ARM64) target=aarch64-pc-windows-msvc ;;
+          *) echo "The DocSpring CLI has no build for $RUNNER_OS_NAME on $RUNNER_ARCH_NAME" >&2; exit 1 ;;
+        esac
+        if [ "$RUNNER_OS_NAME" = Windows ]; then archive="docspring-cli-$target.zip"; else archive="docspring-cli-$target.tar.xz"; fi
+        if [ "$VERSION" = latest ]; then
+          base=https://github.com/DocSpring/docspring-cli/releases/latest/download
+        else
+          base="https://github.com/DocSpring/docspring-cli/releases/download/v${VERSION#v}"
+        fi
+        work="$(mktemp -d)"
+        curl -fsSL --retry 3 -o "$work/$archive" "$base/$archive"
+        curl -fsSL --retry 3 -o "$work/$archive.sha256" "$base/$archive.sha256"
+        expected="$(cut -d ' ' -f 1 < "$work/$archive.sha256")"
+        if command -v sha256sum > /dev/null; then
+          actual="$(sha256sum "$work/$archive" | cut -d ' ' -f 1)"
+        else
+          actual="$(shasum -a 256 "$work/$archive" | cut -d ' ' -f 1)"
+        fi
+        if [ "$actual" != "$expected" ]; then
+          echo "$archive doesn't match its SHA-256 checksum" >&2
+          exit 1
+        fi
+        bin_dir="$RUNNER_TOOL_CACHE/docspring-cli/bin"
+        mkdir -p "$bin_dir"
+        if [ "$RUNNER_OS_NAME" = Windows ]; then
+          unzip -o -q "$work/$archive" docspring.exe -d "$bin_dir"
+        else
+          tar -xJf "$work/$archive" -C "$work"
+          install -m 0755 "$work/docspring-cli-$target/docspring" "$bin_dir/docspring"
+        fi
+        echo "$bin_dir" >> "$GITHUB_PATH"
+        # Updating belongs in the workflow: pin a version with this action's `version` input
+        echo "DOCSPRING_NO_SELF_UPDATE=1" >> "$GITHUB_ENV"
+        installed="$("$bin_dir/docspring" --version | cut -d ' ' -f 2)"
+        echo "version=$installed" >> "$GITHUB_OUTPUT"
+        echo "Installed the DocSpring CLI $installed"

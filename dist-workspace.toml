@@ -1,0 +1,43 @@
+[workspace]
+members = ["cargo:."]
+
+# dist builds the release binaries, installers and Homebrew formula when a version tag is pushed
+# (https://github.com/axodotdev/cargo-dist). After changing this file, run `dist generate` to update
+# .github/workflows/release.yml.
+[dist]
+cargo-dist-version = "0.33.1"
+ci = "github"
+installers = ["shell", "powershell", "homebrew"]
+tap = "DocSpring/homebrew-tap"
+formula = "docspring"
+publish-jobs = ["homebrew", "./publish-crates"]
+# A custom publish job gets only id-token and packages unless this says otherwise, and publish-crates.yml checks out
+# the repository; a called workflow can't ask for more than its caller grants
+github-custom-job-permissions = { "publish-crates" = { contents = "read", id-token = "write" } }
+# Linux builds use musl, so they run on any distribution
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "aarch64-unknown-linux-musl",
+  "x86_64-unknown-linux-musl",
+  "aarch64-pc-windows-msvc",
+  "x86_64-pc-windows-msvc",
+]
+install-path = "~/.docspring/bin"
+# `docspring update` replaces the binary itself
+install-updater = false
+checksum = "sha256"
+github-attestations = true
+# Signs the macOS binaries with DocSpring's Developer ID (CODESIGN_* secrets in the docspring-cli repo,
+# internal_docs/sdk-generation.md), so the keychain keeps trusting the CLI after each update
+macos-sign = true
+pr-run-mode = "plan"
+
+# Every action in release.yml pinned to a commit, with its version in a comment (the comment goes into the workflow
+# as written): the same commits as the SDKs' release workflows (api_clients/github_workflows/), which
+# spec/api_clients/github_workflows_spec.rb checks. A new action that dist adds needs a line here.
+[dist.github-action-commits]
+"actions/checkout" = "3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1"
+"actions/upload-artifact" = "cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2"
+"actions/download-artifact" = "9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2"
+"actions/attest" = "1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2"

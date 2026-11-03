@@ -1,0 +1,2 @@
+# The CLI is written with lines up to 150 characters, like the monorepo's Ruby
+max_width = 150

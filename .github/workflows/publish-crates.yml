@@ -1,0 +1,52 @@
+# Publishes docspring-cli to crates.io for a release (release.yml runs it after the binaries are built). It uses
+# crates.io's trusted publishing, so there's no crates.io token here: crates.io trusts this repository's release.yml in
+# the `release` environment, whose required reviewer approves each publish. A version crates.io already has is skipped
+# (the first release was published from a maintainer's machine, before trusted publishing could be set up).
+name: Publish to crates.io
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Find the version
+        id: version
+        env:
+          PLAN: ${{ inputs.plan }}
+        run: |
+          version=$(jq -r '.releases[] | select(.app_name == "docspring-cli") | .app_version' <<< "$PLAN")
+          if [ -z "$version" ]; then
+            echo "The release plan has no docspring-cli release" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # crates.io's API refuses requests without a User-Agent
+          if curl -fsS -o /dev/null -A "docspring-cli release (support@docspring.com)" \
+            "https://crates.io/api/v1/crates/docspring-cli/$version"; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "crates.io already has docspring-cli $version"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Get a crates.io token
+        if: steps.version.outputs.published == 'false'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+      - name: Publish
+        if: steps.version.outputs.published == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked

@@ -461,6 +461,105 @@ fn a_token_login_to_a_server_without_api_v2_says_which_release_it_needs() {
     assert!(!dir.path().join("config/config.toml").exists(), "no profile is saved");
 }
 
+#[test]
+fn a_profiles_login_never_goes_to_a_host_the_command_names() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let config = dir.path().join("config");
+    std::fs::create_dir(&config).expect("create the config directory");
+    let own = Server::start(|_request, _base| Reply::json(200, json!({"authenticated": true})));
+    let other = Server::start(|_request, _base| Reply::json(200, json!({"authenticated": true})));
+    std::fs::write(
+        config.join("config.toml"),
+        format!(
+            "default_profile = \"default\"\n[profiles.default]\ncredential = \"login\"\nhost = \"{0}\"\nissuer = \"{0}\"\n",
+            own.url
+        ),
+    )
+    .expect("write config.toml");
+    save_login(&config, "access");
+
+    for flags in [vec!["--host", other.url.as_str()], vec!["--region", "EU"]] {
+        let output = docspring(dir.path())
+            .args(["auth", "check"])
+            .args(&flags)
+            .output()
+            .expect("run docspring");
+        assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+        assert!(
+            stderr(&output).contains("a profile's credentials only go to its own"),
+            "{}",
+            stderr(&output)
+        );
+    }
+    assert!(other.requests().is_empty(), "{:?}", other.requests());
+    assert!(own.requests().is_empty(), "{:?}", own.requests());
+
+    // Its own host, however it's written, is fine
+    let output = docspring(dir.path())
+        .args(["auth", "check", "--host", &format!("{}/", own.url)])
+        .output()
+        .expect("run docspring");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(own.requests().len(), 1, "{:?}", own.requests());
+    assert_eq!(own.requests()[0].2.as_deref(), Some("Bearer access"));
+}
+
+#[test]
+fn a_token_login_without_flags_goes_to_docspring_host() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let server = Server::start(|_request, _base| Reply::json(200, json!({"authenticated": true})));
+    let mut child = docspring(dir.path())
+        .args(["login", "--with-token"])
+        .env("DOCSPRING_HOST", &server.url)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run docspring login");
+    child
+        .stdin
+        .take()
+        .expect("login's standard input")
+        .write_all(b"api_test\nsecret\n")
+        .expect("send the API token");
+    let output = child.wait_with_output().expect("login finishes");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(server.requests().len(), 1, "{:?}", server.requests());
+    let config = std::fs::read_to_string(dir.path().join("config/config.toml")).expect("the saved profile");
+    assert!(config.contains(&format!("host = \"{}\"", server.url)), "{config}");
+}
+
+#[test]
+fn a_file_the_api_has_no_hash_for_is_checked_by_its_size() {
+    let file_without_hash = |size: usize| {
+        move |request: &Request, base: &str| match request.path.as_str() {
+            "/file" => Reply::pdf(),
+            _ => {
+                let mut value = submission("processed", base, "audit_trail", false);
+                value["files"]["audit_trail"]["sha256"] = Value::Null;
+                value["files"]["audit_trail"]["size"] = json!(size);
+                Reply::json(200, value)
+            }
+        }
+    };
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let server = Server::start(file_without_hash(PDF.len() + 1));
+    let args = ["submissions", "download", "sub_test", "--file", "audit-trail", "-o", "audit.pdf"];
+    let output = with_token(docspring(dir.path()).args(args), &server);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains(&format!("is {} bytes, not {}: try again", PDF.len(), PDF.len() + 1)),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!dir.path().join("audit.pdf").exists(), "nothing is saved");
+
+    let server = Server::start(file_without_hash(PDF.len()));
+    let output = with_token(docspring(dir.path()).args(args), &server);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(std::fs::read(dir.path().join("audit.pdf")).expect("the saved audit trail"), PDF);
+}
+
 /// An account export's archive, as the app's export services make it (`tar -zcf archive.tar.gz .` in a folder with
 /// index.json), with a link that extraction must skip
 fn export_archive(files: &[(&str, &str)]) -> Vec<u8> {

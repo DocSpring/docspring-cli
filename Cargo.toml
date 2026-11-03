@@ -1,6 +1,6 @@
 [package]
 name = "docspring-cli"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 rust-version = "1.88"
 # Its own tests (cargo test in this directory) resolve dependencies that build with rust-version

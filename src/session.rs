@@ -2,16 +2,17 @@
 //!
 //! A profile named with --profile or DOCSPRING_PROFILE comes first, so an API token exported in the shell can't
 //! silently replace the profile you asked for. Then the API token in DOCSPRING_TOKEN_ID and DOCSPRING_TOKEN_SECRET
-//! (CI and agents), then the default profile.
+//! (CI and agents), then the default profile. A profile's requests always go to the server it was saved for: its
+//! credentials are never sent anywhere else.
 
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::{config_dir, Config, CredentialKind, Profile};
+use crate::config::{config_dir, saved_by_newer_cli, Config, CredentialKind, Profile};
 use crate::errors::CliError;
 use crate::oauth;
-use crate::secrets::{self, Secret, SecretStore};
+use crate::secrets::{self, CredentialsLock, Secret, SecretStore};
 use crate::GlobalArgs;
 
 const US_API_HOST: &str = "sync.api.docspring.com";
@@ -106,13 +107,22 @@ fn access_token_changed(store: &SecretStore, profile: &str, used: &str) -> bool 
 
 async fn profile_session(global: &GlobalArgs, name: String) -> Result<(String, Auth, Option<String>), CliError> {
     let dir = config_dir()?;
-    let config = Config::load(&dir)?;
-    let profile = config.profile(&name)?.clone();
-    let host = api_host(
-        global.host.clone().or(profile.host.clone()),
-        global.region.clone().or(profile.region.clone()),
-    )?;
     let store = SecretStore::new(&dir)?;
+    let (host, auth) = profile_credentials(&dir, &store, global, &name).await?;
+    Ok((host, auth, Some(name)))
+}
+
+/// A profile's server and credentials, read (and refreshed) under the credentials lock. A login saves a profile and its
+/// secret under that lock, so they're read as a pair: without it, a command could read the profile's old server and
+/// the tokens a login in another terminal just saved for a new one, and send them to the old server.
+async fn profile_credentials(dir: &Path, store: &SecretStore, global: &GlobalArgs, name: &str) -> Result<(String, Auth), CliError> {
+    let lock = secrets::lock(dir).await?;
+    let config = Config::load(dir)?;
+    let profile = config.profile(name)?;
+    if let CredentialKind::Other(kind) = &profile.credential {
+        return Err(saved_by_newer_cli(name, kind));
+    }
+    let host = profile_host(name, profile, global)?;
     let not_saved = || {
         CliError::auth(format!(
             "Profile {name} has no saved credentials. Run `docspring login --profile {name}`{}.",
@@ -123,7 +133,7 @@ async fn profile_session(global: &GlobalArgs, name: String) -> Result<(String, A
             }
         ))
     };
-    let auth = match (profile.credential, store.get(&name)?) {
+    let auth = match (&profile.credential, store.get(name)?) {
         (CredentialKind::ApiToken, Some(Secret::ApiToken { token_secret })) => {
             let token_id = profile.token_id.clone().ok_or_else(not_saved)?;
             Auth::Basic { token_id, token_secret }
@@ -131,18 +141,43 @@ async fn profile_session(global: &GlobalArgs, name: String) -> Result<(String, A
         (
             CredentialKind::Login,
             Some(Secret::Login {
-                access_token, expires_at, ..
+                access_token,
+                refresh_token,
+                expires_at,
             }),
         ) => {
             if expiring(expires_at) {
-                Auth::Bearer(refresh(&dir, &store, &name, &profile).await?)
+                Auth::Bearer(refresh(&lock, store, name, profile, access_token, refresh_token, expires_at).await?)
             } else {
                 Auth::Bearer(access_token)
             }
         }
         _ => return Err(not_saved()),
     };
-    Ok((host, auth, Some(name)))
+    Ok((host, auth))
+}
+
+/// The profile's own server. A --host or --region for another one is refused: sending a login's access token or an API
+/// token's secret to whatever host a command names would hand it to that host.
+fn profile_host(name: &str, profile: &Profile, global: &GlobalArgs) -> Result<String, CliError> {
+    let host = api_host(profile.host.clone(), profile.region.clone())?;
+    if global.host.is_none() && global.region.is_none() {
+        return Ok(host);
+    }
+    let asked = api_host(global.host.clone(), global.region.clone())?;
+    if api_base(&asked).eq_ignore_ascii_case(&api_base(&host)) {
+        return Ok(host);
+    }
+    let flag = match (&global.host, &global.region) {
+        (Some(host), _) => format!("--host {}", host.trim()),
+        (None, region) => format!("--region {}", region.as_deref().unwrap_or_default().to_uppercase()),
+    };
+    Err(CliError::usage(format!(
+        "Profile {name} is for DocSpring {}, and {flag} is another server: a profile's credentials only go to its own. \
+         Leave out --host and --region to use profile {name}, or save a profile for that server with \
+         `docspring login --profile <name> {flag}`.",
+        profile.location()
+    )))
 }
 
 fn expiring(expires_at: Option<i64>) -> bool {
@@ -156,11 +191,18 @@ pub fn now() -> i64 {
         .as_secs() as i64
 }
 
-/// Refreshes a login's access token under the credentials lock. Another command may have refreshed it while this one
-/// waited for the lock, so it reads the tokens again first: refreshing with the old refresh token after the new one
-/// was used would make the server revoke the whole login.
-async fn refresh(dir: &Path, store: &SecretStore, name: &str, profile: &Profile) -> Result<String, CliError> {
-    let _lock = secrets::lock(dir).await?;
+/// Refreshes a login's access token. The caller holds the credentials lock and read the tokens under it, so no other
+/// command refreshes them at the same time: refreshing with the old refresh token after the new one was used would make
+/// the server revoke the whole login.
+async fn refresh(
+    _lock: &CredentialsLock,
+    store: &SecretStore,
+    name: &str,
+    profile: &Profile,
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at: Option<i64>,
+) -> Result<String, CliError> {
     let expired = || {
         CliError::auth(format!(
             "Profile {name}'s login has expired or was disconnected (on the Integrations page in DocSpring, or by logging \
@@ -172,17 +214,6 @@ async fn refresh(dir: &Path, store: &SecretStore, name: &str, profile: &Profile)
             }
         ))
     };
-    let Some(Secret::Login {
-        access_token,
-        refresh_token,
-        expires_at,
-    }) = store.get(name)?
-    else {
-        return Err(expired());
-    };
-    if !expiring(expires_at) {
-        return Ok(access_token);
-    }
     let refresh_token = refresh_token.ok_or_else(expired)?;
     let issuer = profile.issuer.clone().ok_or_else(expired)?;
     let http = http_client()?;
@@ -322,6 +353,56 @@ mod tests {
     }
 
     #[test]
+    fn a_profile_only_sends_its_credentials_to_its_own_server() {
+        let global = |host: Option<&str>, region: Option<&str>| GlobalArgs {
+            host: host.map(str::to_owned),
+            region: region.map(str::to_owned),
+            ..GlobalArgs::default()
+        };
+        let profile = |host: Option<&str>, region: Option<&str>| Profile {
+            credential: CredentialKind::Login,
+            region: region.map(str::to_owned),
+            host: host.map(str::to_owned),
+            issuer: None,
+            scope: None,
+            token_id: None,
+            unknown: Default::default(),
+        };
+        let eu = profile(None, Some("EU"));
+        assert_eq!(profile_host("work", &eu, &global(None, None)).unwrap(), EU_API_HOST);
+        assert_eq!(profile_host("work", &eu, &global(None, Some("eu"))).unwrap(), EU_API_HOST);
+        assert_eq!(profile_host("work", &eu, &global(Some(EU_API_HOST), None)).unwrap(), EU_API_HOST);
+        let error = profile_host("work", &eu, &global(None, Some("us"))).unwrap_err();
+        assert_eq!(
+            error.message,
+            "Profile work is for DocSpring EU, and --region US is another server: a profile's credentials only go to its \
+             own. Leave out --host and --region to use profile work, or save a profile for that server with \
+             `docspring login --profile <name> --region US`."
+        );
+        assert!(profile_host("work", &eu, &global(Some("attacker.example.com"), Some("EU"))).is_err());
+
+        // A profile saved without a region is a US one
+        let us = profile(None, None);
+        assert_eq!(profile_host("default", &us, &global(None, Some("US"))).unwrap(), US_API_HOST);
+        assert!(profile_host("default", &us, &global(None, Some("EU"))).is_err());
+
+        let enterprise = profile(Some("docspring.example.com"), None);
+        assert_eq!(
+            profile_host("ent", &enterprise, &global(Some("https://DocSpring.example.com/"), None)).unwrap(),
+            "docspring.example.com"
+        );
+        let error = profile_host("ent", &enterprise, &global(Some("localhost:3000"), None)).unwrap_err();
+        assert!(
+            error
+                .message
+                .starts_with("Profile ent is for DocSpring docspring.example.com, and --host localhost:3000"),
+            "{}",
+            error.message
+        );
+        assert!(profile_host("ent", &enterprise, &global(None, Some("US"))).is_err());
+    }
+
+    #[test]
     fn a_login_is_replaced_when_its_saved_access_token_changes() {
         let dir = tempfile::tempdir().unwrap();
         let store = SecretStore::file_only(dir.path());
@@ -360,18 +441,74 @@ mod tests {
             issuer: Some("http://127.0.0.1:1".to_owned()),
             scope: None,
             token_id: None,
+            unknown: Default::default(),
         };
-        let login = |expires_at: i64| Secret::Login {
-            access_token: "access".to_owned(),
-            refresh_token: Some("refresh".to_owned()),
-            expires_at: Some(expires_at),
+        let lock = secrets::lock(dir.path()).await.unwrap();
+        let refresh_expiring = |expires_at: i64| {
+            refresh(
+                &lock,
+                &store,
+                "default",
+                &profile,
+                "access".to_owned(),
+                Some("refresh".to_owned()),
+                Some(expires_at),
+            )
         };
-        store.set("default", &login(now() + 300)).unwrap();
-        assert_eq!(refresh(dir.path(), &store, "default", &profile).await.unwrap(), "access");
+        assert_eq!(refresh_expiring(now() + 300).await.unwrap(), "access");
 
-        store.set("default", &login(now() + 30)).unwrap();
-        let error = refresh(dir.path(), &store, "default", &profile).await.unwrap_err();
+        let error = refresh_expiring(now() + 30).await.unwrap_err();
         assert!(error.message.starts_with("Couldn't reach http://127.0.0.1:1"), "{}", error.message);
+    }
+
+    #[tokio::test]
+    async fn a_command_never_pairs_a_profiles_old_server_with_a_new_logins_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_owned();
+        let store = SecretStore::file_only(&path);
+        let save = |host: &str, access_token: &str, expires_at: i64| {
+            let mut config = Config::default();
+            config.profiles.insert(
+                "work".to_owned(),
+                Profile {
+                    credential: CredentialKind::Login,
+                    region: None,
+                    host: Some(host.to_owned()),
+                    // Nothing listens on port 1: a refresh would fail
+                    issuer: Some("http://127.0.0.1:1".to_owned()),
+                    scope: None,
+                    token_id: None,
+                    unknown: Default::default(),
+                },
+            );
+            config.save(&path).unwrap();
+            let secret = Secret::Login {
+                access_token: access_token.to_owned(),
+                refresh_token: Some("refresh".to_owned()),
+                expires_at: Some(expires_at),
+            };
+            store.set("work", &secret).unwrap();
+        };
+        // Profile work is on server A, and its access token is due for a refresh
+        save("a.example.com", "token-a", now() + 30);
+
+        // A login in another terminal holds the lock while the command starts, then saves work on server B
+        let login = secrets::lock(&path).await.unwrap();
+        let command = {
+            let path = path.clone();
+            tokio::spawn(async move {
+                let store = SecretStore::file_only(&path);
+                profile_credentials(&path, &store, &GlobalArgs::default(), "work").await
+            })
+        };
+        // Long enough for the command to read the config and wait for the lock, if it read before taking it
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        save("b.example.com", "token-b", now() + 3600);
+        drop(login);
+
+        let (host, auth) = command.await.unwrap().unwrap();
+        assert_eq!(host, "b.example.com");
+        assert!(matches!(auth, Auth::Bearer(token) if token == "token-b"));
     }
 
     #[test]

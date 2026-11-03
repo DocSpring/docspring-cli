@@ -379,15 +379,7 @@ async fn save(session: &session::Session, file: &GeneratedFile, output: Option<&
         .bytes()
         .await
         .map_err(|error| CliError::api(format!("Couldn't download {}: {}", file.filename, describe(&error))))?;
-    if let Some(expected) = &file.sha256 {
-        let actual = format!("{:x}", sha2::Sha256::digest(&bytes));
-        if !actual.eq_ignore_ascii_case(expected) {
-            return Err(CliError::api(format!(
-                "The downloaded {} doesn't match its SHA-256 hash ({actual}, not {expected}): try again",
-                file.filename
-            )));
-        }
-    }
+    check_download(file, &bytes)?;
     if output == Some(Path::new("-")) {
         crate::output::text(&bytes);
         return Ok(None);
@@ -395,6 +387,30 @@ async fn save(session: &session::Session, file: &GeneratedFile, output: Option<&
     let path = output_path(output, &file.filename);
     crate::config::write_file(&path, &bytes, false)?;
     Ok(Some(path))
+}
+
+/// Checks a download against the size and SHA-256 hash the API lists for the file. The API has no hash for a few older
+/// files (audit trails made before September 2024), which are checked by size.
+fn check_download(file: &GeneratedFile, bytes: &[u8]) -> Result<(), CliError> {
+    if let Some(expected) = file.size {
+        if bytes.len() as u64 != expected as u64 {
+            return Err(CliError::api(format!(
+                "The downloaded {} is {} bytes, not {expected}: try again",
+                file.filename,
+                bytes.len()
+            )));
+        }
+    }
+    if let Some(expected) = &file.sha256 {
+        let actual = format!("{:x}", sha2::Sha256::digest(bytes));
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(CliError::api(format!(
+                "The downloaded {} doesn't match its SHA-256 hash ({actual}, not {expected}): try again",
+                file.filename
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The output path for a file: the one given, inside it when it's a directory, or the file's own name

@@ -7,7 +7,7 @@ use clap::{Args, Subcommand};
 use docspring::Api;
 use serde_json::json;
 
-use crate::config::{check_profile_name, config_dir, Config, CredentialKind, Profile, DEFAULT_PROFILE};
+use crate::config::{check_profile_name, config_dir, saved_by_newer_cli, Config, CredentialKind, Profile, DEFAULT_PROFILE};
 use crate::errors::CliError;
 use crate::oauth;
 use crate::output;
@@ -89,25 +89,21 @@ pub async fn login(runner: &Runner, args: LoginArgs) -> CommandResult {
     check_profile_name(&name)?;
     let dir = config_dir()?;
     let config = Config::load(&dir)?;
-    let existing = config.profiles.get(&name);
-    // The same server as the profile's last login, unless a flag names another
-    let (region, host) = match (&runner.global.region, &runner.global.host) {
-        (None, None) => existing
-            .map(|profile| (profile.region.clone(), profile.host.clone()))
-            .unwrap_or((Some("US".to_owned()), None)),
-        (region, host) => (region.as_ref().map(|region| region.to_uppercase()), host.clone()),
-    };
-    if args.issuer.is_some() && host.is_none() {
-        return Err(CliError::usage("--issuer is for logging in to a --host"));
-    }
+    let LoginServer { region, host, issuer } = login_server(
+        &runner.global,
+        args.issuer.as_deref(),
+        config.profiles.get(&name),
+        session::env_var("DOCSPRING_HOST"),
+        session::env_var("DOCSPRING_REGION"),
+    )?;
     let store = SecretStore::new(&dir)?;
     let (profile, secret) = if args.with_token {
         token_login(runner, region, host).await?
     } else {
-        browser_login(runner, &args, region, host).await?
+        browser_login(runner, &args, issuer, region, host).await?
     };
     let location = profile.location();
-    let kind = profile.credential;
+    let kind = profile.credential.clone();
     // The config and credentials as they are now, under the lock: another command (a login in another terminal,
     // `profiles use`) may have changed them while this one waited for the browser
     let (saved, config, replaced) = {
@@ -160,9 +156,58 @@ pub async fn login(runner: &Runner, args: LoginArgs) -> CommandResult {
     Ok(())
 }
 
-async fn browser_login(runner: &Runner, args: &LoginArgs, region: Option<String>, host: Option<String>) -> Result<(Profile, Secret), CliError> {
+/// The server a login goes to, and the OAuth server a browser login uses
+#[derive(Debug, PartialEq)]
+struct LoginServer {
+    region: Option<String>,
+    host: Option<String>,
+    issuer: Option<String>,
+}
+
+/// The server a flag names, or the profile's last login's, or DOCSPRING_HOST's or DOCSPRING_REGION's (the variables
+/// that go with an API token in the environment), or the US. Logging in to a host again uses the --issuer its last login
+/// was given.
+fn login_server(
+    global: &crate::GlobalArgs,
+    issuer: Option<&str>,
+    existing: Option<&Profile>,
+    env_host: Option<String>,
+    env_region: Option<String>,
+) -> Result<LoginServer, CliError> {
+    let (region, host) = match (&global.region, &global.host) {
+        (None, None) => match (existing, env_host, env_region) {
+            (Some(profile), _, _) => (profile.region.clone(), profile.host.clone()),
+            (None, Some(host), _) => (None, Some(host)),
+            (None, None, Some(region)) => match region.to_uppercase().as_str() {
+                region @ ("US" | "EU") => (Some(region.to_owned()), None),
+                _ => return Err(CliError::usage(format!("DOCSPRING_REGION is {region:?}: it can be US or EU"))),
+            },
+            (None, None, None) => (Some("US".to_owned()), None),
+        },
+        (region, host) => (region.as_ref().map(|region| region.to_uppercase()), host.clone()),
+    };
+    if issuer.is_some() && host.is_none() {
+        return Err(CliError::usage("--issuer is for logging in to a --host"));
+    }
+    let same_host = |profile: &&Profile| match (&profile.host, &host) {
+        (Some(saved), Some(host)) => session::api_base(saved).eq_ignore_ascii_case(&session::api_base(host)),
+        _ => false,
+    };
+    let issuer = issuer
+        .map(str::to_owned)
+        .or_else(|| existing.filter(same_host).and_then(|profile| profile.issuer.clone()));
+    Ok(LoginServer { region, host, issuer })
+}
+
+async fn browser_login(
+    runner: &Runner,
+    args: &LoginArgs,
+    issuer: Option<String>,
+    region: Option<String>,
+    host: Option<String>,
+) -> Result<(Profile, Secret), CliError> {
     let http = session::http_client()?;
-    let issuer = match (&args.issuer, &host) {
+    let issuer = match (&issuer, &host) {
         (Some(issuer), _) => session::origin(issuer),
         (None, Some(host)) => session::origin(host),
         (None, None) => session::region_issuer(region.as_deref()).to_owned(),
@@ -199,6 +244,7 @@ async fn browser_login(runner: &Runner, args: &LoginArgs, region: Option<String>
         issuer: Some(metadata.issuer.clone()),
         scope: tokens.scope.clone(),
         token_id: None,
+        unknown: Default::default(),
     };
     let secret = Secret::Login {
         access_token: tokens.access_token,
@@ -241,6 +287,7 @@ async fn token_login(runner: &Runner, region: Option<String>, host: Option<Strin
         issuer: None,
         scope: None,
         token_id: Some(token_id),
+        unknown: Default::default(),
     };
     Ok((profile, Secret::ApiToken { token_secret }))
 }
@@ -291,6 +338,10 @@ async fn remove_profile(runner: &Runner, name: &str) -> CommandResult {
     let _lock = secrets::lock(&dir).await?;
     let mut config = Config::load(&dir)?;
     let profile = config.profile(name)?.clone();
+    // This version can't revoke the newer one's credentials, and deleting them would leave them working
+    if let CredentialKind::Other(kind) = &profile.credential {
+        return Err(saved_by_newer_cli(name, kind));
+    }
     {
         // A keychain that can't be read or changed fails the command, which leaves the profile as it was: the login's
         // tokens would otherwise stay saved, and valid
@@ -445,6 +496,7 @@ fn list_profiles(runner: &Runner, with_source: bool) -> CommandResult {
                         id
                     }
                 }
+                CredentialKind::Other(_) => "saved by a newer version of the CLI".to_owned(),
             };
             json!({
                 "profile": format!("{name}{default}"),
@@ -462,4 +514,103 @@ fn list_profiles(runner: &Runner, with_source: bool) -> CommandResult {
         },
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn global(region: Option<&str>, host: Option<&str>) -> crate::GlobalArgs {
+        crate::GlobalArgs {
+            region: region.map(str::to_owned),
+            host: host.map(str::to_owned),
+            ..crate::GlobalArgs::default()
+        }
+    }
+
+    fn server(region: Option<&str>, host: Option<&str>, issuer: Option<&str>) -> LoginServer {
+        LoginServer {
+            region: region.map(str::to_owned),
+            host: host.map(str::to_owned),
+            issuer: issuer.map(str::to_owned),
+        }
+    }
+
+    fn profile(region: Option<&str>, host: Option<&str>, issuer: Option<&str>) -> Profile {
+        Profile {
+            credential: CredentialKind::Login,
+            region: region.map(str::to_owned),
+            host: host.map(str::to_owned),
+            issuer: issuer.map(str::to_owned),
+            scope: None,
+            token_id: None,
+            unknown: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_new_login_uses_the_environments_region_or_host_when_no_flag_names_one() {
+        let env = |name: &str| Some(name.to_owned());
+        assert_eq!(
+            login_server(&global(None, None), None, None, None, None).unwrap(),
+            server(Some("US"), None, None)
+        );
+        assert_eq!(
+            login_server(&global(None, None), None, None, None, env("eu")).unwrap(),
+            server(Some("EU"), None, None)
+        );
+        assert_eq!(
+            login_server(&global(None, None), None, None, env("docspring.example.com"), env("EU")).unwrap(),
+            server(None, Some("docspring.example.com"), None)
+        );
+        assert_eq!(
+            login_server(&global(Some("us"), None), None, None, None, env("EU")).unwrap(),
+            server(Some("US"), None, None)
+        );
+        let error = login_server(&global(None, None), None, None, None, env("AU")).unwrap_err();
+        assert_eq!(error.message, "DOCSPRING_REGION is \"AU\": it can be US or EU");
+
+        // Logging in to a profile again goes to its server
+        let eu = profile(Some("EU"), None, Some("https://app-eu.docspring.com"));
+        assert_eq!(
+            login_server(&global(None, None), None, Some(&eu), None, env("US")).unwrap(),
+            server(Some("EU"), None, None)
+        );
+    }
+
+    #[test]
+    fn logging_in_to_a_host_again_uses_its_last_issuer() {
+        let enterprise = profile(None, Some("api.docspring.example.com"), Some("https://docspring.example.com"));
+        let issuer = Some("https://docspring.example.com");
+        assert_eq!(
+            login_server(&global(None, None), None, Some(&enterprise), None, None).unwrap(),
+            server(None, Some("api.docspring.example.com"), issuer)
+        );
+        assert_eq!(
+            login_server(
+                &global(None, Some("https://API.docspring.example.com/")),
+                None,
+                Some(&enterprise),
+                None,
+                None
+            )
+            .unwrap(),
+            server(None, Some("https://API.docspring.example.com/"), issuer)
+        );
+        // --issuer replaces it, and another host doesn't use it
+        assert_eq!(
+            login_server(&global(None, None), Some("https://sso.example.com"), Some(&enterprise), None, None).unwrap(),
+            server(None, Some("api.docspring.example.com"), Some("https://sso.example.com"))
+        );
+        assert_eq!(
+            login_server(&global(None, Some("other.example.com")), None, Some(&enterprise), None, None).unwrap(),
+            server(None, Some("other.example.com"), None)
+        );
+        assert_eq!(
+            login_server(&global(Some("EU"), None), None, Some(&enterprise), None, None).unwrap(),
+            server(Some("EU"), None, None)
+        );
+        let error = login_server(&global(Some("EU"), None), Some("https://sso.example.com"), None, None, None).unwrap_err();
+        assert_eq!(error.message, "--issuer is for logging in to a --host");
+    }
 }

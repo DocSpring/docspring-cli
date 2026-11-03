@@ -18,6 +18,9 @@ pub struct Config {
     pub default_profile: Option<String>,
     #[serde(default)]
     pub profiles: BTreeMap<String, Profile>,
+    /// Settings a newer version of the CLI saved, kept as they are when this one saves the file
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, toml::Value>,
 }
 
 /// Where a profile's requests go and which kind of credential it has
@@ -39,24 +42,58 @@ pub struct Profile {
     /// An API token's ID (its secret is stored with the secrets)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_id: Option<String>,
+    /// Settings a newer version of the CLI saved, kept as they are when this one saves the file
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, toml::Value>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
 pub enum CredentialKind {
     /// OAuth tokens from `docspring login`
     Login,
     /// An API token saved with `docspring login --with-token`
     ApiToken,
+    /// A kind of credential a newer version of the CLI saved. Only its profile fails, and it's kept as it is.
+    Other(String),
+}
+
+impl From<String> for CredentialKind {
+    fn from(kind: String) -> CredentialKind {
+        match kind.as_str() {
+            "login" => CredentialKind::Login,
+            "api_token" => CredentialKind::ApiToken,
+            _ => CredentialKind::Other(kind),
+        }
+    }
+}
+
+impl From<CredentialKind> for String {
+    fn from(kind: CredentialKind) -> String {
+        match kind {
+            CredentialKind::Login => "login".to_owned(),
+            CredentialKind::ApiToken => "api_token".to_owned(),
+            CredentialKind::Other(kind) => kind,
+        }
+    }
 }
 
 impl CredentialKind {
-    pub fn label(self) -> &'static str {
+    pub fn label(&self) -> &str {
         match self {
             CredentialKind::Login => "login",
             CredentialKind::ApiToken => "API token",
+            CredentialKind::Other(kind) => kind,
         }
     }
+}
+
+/// What a command says about a profile a newer version of the CLI saved, with a kind of credential this one can't use
+pub fn saved_by_newer_cli(name: &str, kind: &str) -> CliError {
+    CliError::auth(format!(
+        "Profile {name} was saved by a newer version of the DocSpring CLI (its credential is a {kind}), which this \
+         version can't use. Update the CLI (`docspring update`), or log in again with `docspring login --profile {name}`."
+    ))
 }
 
 impl Profile {
@@ -190,12 +227,53 @@ mod tests {
                 issuer: Some("https://app-eu.docspring.com".to_owned()),
                 scope: Some("read write".to_owned()),
                 token_id: None,
+                unknown: BTreeMap::new(),
             },
         );
         config.save(dir.path()).unwrap();
         let text = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
         assert!(text.contains("default_profile = \"work\""), "{text}");
         assert!(text.contains("credential = \"login\""), "{text}");
+        assert_eq!(Config::load(dir.path()).unwrap(), config);
+    }
+
+    #[test]
+    fn a_profile_from_a_newer_cli_is_kept_and_the_others_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = r#"default_profile = "work"
+newer_setting = 1
+
+[profiles.work]
+credential = "login"
+region = "EU"
+issuer = "https://app-eu.docspring.com"
+account = "acc_123"
+
+[profiles.robot]
+credential = "service_account"
+client_id = "cli_123"
+"#;
+        std::fs::write(dir.path().join("config.toml"), text).unwrap();
+        let mut config = Config::load(dir.path()).unwrap();
+        let work = config.profile("work").unwrap();
+        assert_eq!(work.credential, CredentialKind::Login);
+        assert_eq!(work.location(), "EU");
+        let robot = config.profile("robot").unwrap();
+        assert_eq!(robot.credential, CredentialKind::Other("service_account".to_owned()));
+        assert_eq!(robot.credential.label(), "service_account");
+
+        // Saving keeps what this version doesn't know
+        config.default_profile = Some("robot".to_owned());
+        config.save(dir.path()).unwrap();
+        let saved = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        for line in [
+            "newer_setting = 1",
+            "account = \"acc_123\"",
+            "credential = \"service_account\"",
+            "client_id = \"cli_123\"",
+        ] {
+            assert!(saved.contains(line), "{line} in {saved}");
+        }
         assert_eq!(Config::load(dir.path()).unwrap(), config);
     }
 

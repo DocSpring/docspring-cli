@@ -65,10 +65,25 @@ pub struct SecretStore {
     keychain: Keychain,
 }
 
+/// credentials.toml. Each profile's entry is read only when it's used, so an entry this version can't read (one a newer
+/// version saved) fails only its own profile, and it's kept as it is when another profile's secret is saved.
 #[derive(Default, Serialize, Deserialize)]
 struct CredentialsFile {
     #[serde(default)]
-    profiles: BTreeMap<String, Secret>,
+    profiles: BTreeMap<String, toml::Value>,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
+}
+
+/// A profile's saved secret, from the keychain's JSON or the file's TOML. The errors never quote the entry: it holds
+/// tokens.
+fn read_secret(profile: &str, entry: serde_json::Value, source: &str) -> Result<Secret, String> {
+    let invalid = || format!("{source} for profile {profile} isn't valid. Log in again with `docspring login --profile {profile}`.");
+    match entry.get("kind").and_then(serde_json::Value::as_str) {
+        Some("login" | "api_token") => serde_json::from_value(entry).map_err(|_| invalid()),
+        Some(kind) => Err(crate::config::saved_by_newer_cli(profile, kind).message),
+        None => Err(invalid()),
+    }
 }
 
 impl SecretStore {
@@ -138,7 +153,12 @@ impl SecretStore {
             return Ok(None);
         }
         match self.read_file()?.profiles.remove(profile) {
-            Some(secret) => Ok(Some(secret)),
+            Some(entry) => {
+                let entry = serde_json::to_value(entry).map_err(|_| CliError::auth(format!("{} isn't valid", self.file.display())))?;
+                read_secret(profile, entry, &format!("The entry in {}", self.file.display()))
+                    .map(Some)
+                    .map_err(CliError::auth)
+            }
             // Nothing in the file either: the keychain's error says why nothing was found
             None => match keychain_error {
                 Some(error) if self.keychain.available() => Err(CliError::auth(error)),
@@ -162,7 +182,8 @@ impl SecretStore {
             }
         }
         let mut file = self.read_file()?;
-        file.profiles.insert(profile.to_owned(), secret.clone());
+        file.profiles
+            .insert(profile.to_owned(), toml::Value::try_from(secret).expect("secrets serialize"));
         self.write_file(&file)?;
         if let Some(error) = &reason {
             // get reads the keychain first, so an older entry there would hide the secret just saved (a refresh token
@@ -258,9 +279,8 @@ impl Keychain {
                 None => return Ok(None),
             },
         };
-        serde_json::from_str(&json)
-            .map(Some)
-            .map_err(|error| format!("The keychain's entry for profile {profile} isn't valid: {error}"))
+        let entry = serde_json::from_str(&json).map_err(|_| format!("The keychain's entry for profile {profile} isn't valid"))?;
+        read_secret(profile, entry, "The keychain's entry").map(Some)
     }
 
     fn set(&self, account: &str, profile: &str, secret: &Secret) -> Result<(), String> {
@@ -316,9 +336,10 @@ impl FakeKeychain {
     }
 }
 
-/// Held while a command refreshes a login's tokens or changes saved secrets, so two commands never refresh the same
-/// login at once: the server revokes every token of a login whose old refresh token is used after the new one. Locks
-/// are released when the process exits, even when it crashes.
+/// Held while a command reads a profile and its secret (and refreshes a login's tokens), or changes saved profiles and
+/// secrets. Two commands never refresh the same login at once: the server revokes every token of a login whose old
+/// refresh token is used after the new one. And a command never reads a profile's server from before a login and its
+/// tokens from after it. Locks are released when the process exits, even when it crashes.
 pub struct CredentialsLock {
     _file: std::fs::File,
 }
@@ -397,6 +418,67 @@ mod tests {
         store.delete("default").unwrap();
         assert_eq!(store.get("default").unwrap(), None);
         assert_eq!(store.get("ci").unwrap(), Some(token));
+    }
+
+    #[test]
+    fn a_secret_from_a_newer_cli_fails_only_its_own_profile_and_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("credentials.toml"),
+            "newer_setting = true\n\n[profiles.robot]\nkind = \"service_account\"\nclient_secret = \"robot-secret\"\n\n\
+             [profiles.broken]\naccess_token = \"broken-secret\"\n\n[profiles.ci]\nkind = \"api_token\"\ntoken_secret = \"secret\"\n",
+        )
+        .unwrap();
+        let store = SecretStore::file_only(dir.path());
+        let token = Secret::ApiToken {
+            token_secret: "secret".to_owned(),
+        };
+        assert_eq!(store.get("ci").unwrap(), Some(token));
+        let error = store.get("robot").unwrap_err();
+        assert!(
+            error
+                .message
+                .starts_with("Profile robot was saved by a newer version of the DocSpring CLI"),
+            "{}",
+            error.message
+        );
+        let error = store.get("broken").unwrap_err();
+        assert!(
+            error
+                .message
+                .ends_with("for profile broken isn't valid. Log in again with `docspring login --profile broken`."),
+            "{}",
+            error.message
+        );
+        assert!(!error.message.contains("secret"), "{}", error.message);
+
+        // Saving another profile's secret keeps the entries this version can't read
+        store.set("default", &login("access")).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("credentials.toml")).unwrap();
+        for line in ["newer_setting = true", "kind = \"service_account\"", "client_secret = \"robot-secret\""] {
+            assert!(text.contains(line), "{line}");
+        }
+        assert_eq!(store.get("default").unwrap(), Some(login("access")));
+    }
+
+    #[test]
+    fn a_keychain_entry_from_a_newer_cli_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let keychain = std::sync::Arc::new(FakeKeychain::default());
+        let store = SecretStore::with_fake_keychain(dir.path(), &keychain);
+        keychain.entries.lock().unwrap().insert(
+            "robot".to_owned(),
+            r#"{"kind":"service_account","client_secret":"robot-secret"}"#.to_owned(),
+        );
+        let error = store.get("robot").unwrap_err();
+        assert!(
+            error
+                .message
+                .starts_with("Profile robot was saved by a newer version of the DocSpring CLI"),
+            "{}",
+            error.message
+        );
+        assert!(!error.message.contains("robot-secret"), "{}", error.message);
     }
 
     fn login(access_token: &str) -> Secret {

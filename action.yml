@@ -17,7 +17,7 @@ inputs:
       The version to install, such as 1.2.0, or latest. Default this action's own release, so
       DocSpring/docspring-cli@v1 installs the newest 1.x.
     required: false
-    default: "1.0.0-rc.2"
+    default: "1.0.0"
 outputs:
   version:
     description: The version that was installed

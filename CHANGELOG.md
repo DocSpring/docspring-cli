@@ -1,3 +1,11 @@
+### 1.1.0 [November 18, 2026]
+
+- New: `docspring support`, for AI agents that use the CLI and for you. `support ask` puts a question to DocSpring's
+  AI help, which answers from the documentation, and `support get-answer` reads an answer again. `support send-feedback` tells us what got in the way.
+  `support open-ticket` opens a ticket that a person on our team answers, with `support list-tickets`,
+  `support get-ticket` and `support reply` to follow it, and `support watch` waits until the team replies, then prints
+  the ticket. See [Support for AI agents](https://docspring.com/docs/api-guide/support-for-ai-agents/).
+
 ### 1.0.1 [November 3, 2026]
 
 - A profile's credentials only go to the server it was saved for. A command that uses a profile with `--region` or

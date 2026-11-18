@@ -1,0 +1,38 @@
+# Written by DocSpring/docspring's api_clients/scripts/cli/post-generate from api_clients/client_templates/cli/.shiplist.yml:
+# change it there.
+#
+# The files the docspring-cli crate may hold (https://github.com/DocSpring/shiplist). publish-crates.yml packages it and
+# fails if it has any other file. Cargo.toml's `exclude` leaves the rest out.
+version: 1
+stages: [package]
+
+remove_before:
+  package:
+    include:
+      - '.*'
+      - '.*/**'
+      - 'action.yml'
+      - 'dist-workspace.toml'
+      - 'rustfmt.toml'
+    exclude:
+      # cargo package writes it
+      - { path: '.cargo_vcs_info.json', untracked: true }
+
+keep:
+  include:
+    - 'src/'
+    - 'tests/'
+    - 'CHANGELOG.md'
+    - 'Cargo.lock'
+    - 'Cargo.toml'
+    - 'LICENSE'
+    - 'README.md'
+
+forbid:
+  - '**/.env'
+  - '**/.env.*'
+
+# What cargo package writes: the original manifest and the commit it packaged
+build_output:
+  - '.cargo_vcs_info.json'
+  - 'Cargo.toml.orig'

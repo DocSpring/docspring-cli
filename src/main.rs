@@ -13,6 +13,7 @@ mod output;
 mod runner;
 mod secrets;
 mod session;
+mod support;
 mod update;
 
 use std::process::ExitCode;

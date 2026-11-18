@@ -146,14 +146,14 @@ pub async fn submit(runner: &Runner, args: SubmitArgs) -> CommandResult {
     }
     let body = runner.body_from_value("createSubmission", value)?;
     let session = runner.session().await?;
-    let params = docspring::CreateSubmissionParams {
-        template_id: args.template_id,
-        body,
-        version: args.version,
+    let params = docspring::CreateSubmissionParams::builder()
+        .template_id(args.template_id)
+        .body(body)
+        .maybe_version(args.version)
         // Polled below instead, so --timeout bounds the wait: the sync host would hold the request for up to 5 minutes
-        wait: Some(false),
-        idempotency_key: Some(args.idempotency_key.unwrap_or_else(|| process_idempotency_key().to_owned())),
-    };
+        .wait(false)
+        .idempotency_key(args.idempotency_key.unwrap_or_else(|| process_idempotency_key().to_owned()))
+        .build();
     let submission = session.client.create_submission(params).await.map_err(CliError::from_sdk)?;
     let document = args.format.unwrap_or_else(|| Document::default_for(&submission.output_formats));
     let submission = wait_for_file(runner, submission, document, Duration::from_secs(args.timeout)).await?;
@@ -197,9 +197,7 @@ fn request_format(body: &mut serde_json::Map<String, serde_json::Value>, format:
 
 pub async fn download(runner: &Runner, args: DownloadArgs) -> CommandResult {
     let session = runner.session().await?;
-    let params = docspring::GetSubmissionParams {
-        submission_id: args.submission_id,
-    };
+    let params = docspring::GetSubmissionParams::builder().submission_id(args.submission_id).build();
     let submission = session.client.get_submission(params).await.map_err(CliError::from_sdk)?;
     let (file, name) = match args.file {
         FileKind::Pdf => (submission.files.pdf.clone(), "PDF"),
@@ -267,9 +265,7 @@ async fn wait_for_file(runner: &Runner, mut submission: Submission, document: Do
         }
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(Duration::from_secs(3));
-        let params = docspring::GetSubmissionParams {
-            submission_id: submission.id.clone(),
-        };
+        let params = docspring::GetSubmissionParams::builder().submission_id(submission.id.clone()).build();
         // The check gets only the time that's left: the HTTP client limits how long a connection takes, not a response
         let check = async { runner.client().await?.get_submission(params).await.map_err(CliError::from_sdk) };
         submission = match tokio::time::timeout(timeout.saturating_sub(started.elapsed()), check).await {

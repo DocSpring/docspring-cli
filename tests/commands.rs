@@ -19,6 +19,7 @@ struct Request {
     method: String,
     path: String,
     authorization: Option<String>,
+    if_none_match: Option<String>,
 }
 
 struct Reply {
@@ -75,6 +76,12 @@ impl Server {
     }
 }
 
+/// The ETag the test server sends with a body
+fn etag(body: &[u8]) -> String {
+    let digest: String = sha2::Sha256::digest(body).iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("\"{digest}\"")
+}
+
 fn serve(mut stream: TcpStream, handler: &Handler, log: &RequestLog, base: &str) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone the test server's connection"));
     let mut line = String::new();
@@ -83,7 +90,7 @@ fn serve(mut stream: TcpStream, handler: &Handler, log: &RequestLog, base: &str)
     }
     let mut words = line.split_whitespace();
     let (method, path) = (words.next().unwrap_or_default().to_owned(), words.next().unwrap_or_default().to_owned());
-    let (mut length, mut authorization) = (0, None);
+    let (mut length, mut authorization, mut if_none_match) = (0, None, None);
     loop {
         let mut header = String::new();
         if reader.read_line(&mut header).unwrap_or(0) == 0 || header.trim().is_empty() {
@@ -93,6 +100,7 @@ fn serve(mut stream: TcpStream, handler: &Handler, log: &RequestLog, base: &str)
             match name.trim().to_ascii_lowercase().as_str() {
                 "content-length" => length = value.trim().parse().expect("a numeric Content-Length"),
                 "authorization" => authorization = Some(value.trim().to_owned()),
+                "if-none-match" => if_none_match = Some(value.trim().to_owned()),
                 _ => {}
             }
         }
@@ -102,16 +110,25 @@ fn serve(mut stream: TcpStream, handler: &Handler, log: &RequestLog, base: &str)
     log.lock()
         .expect("the request log")
         .push((method.clone(), path.clone(), authorization.clone()));
-    let reply = handler(&Request { method, path, authorization }, base);
+    let reply = handler(
+        &Request {
+            method,
+            path,
+            authorization,
+            if_none_match,
+        },
+        base,
+    );
     let content_type = if reply.body.starts_with(b"{") {
         "application/json"
     } else {
         "application/pdf"
     };
     let head = format!(
-        "HTTP/1.1 {} Test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} Test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nETag: {}\r\nConnection: close\r\n\r\n",
         reply.status,
-        reply.body.len()
+        reply.body.len(),
+        etag(&reply.body)
     );
     // The CLI may have stopped waiting
     let _ = stream.write_all(head.as_bytes()).and_then(|()| stream.write_all(&reply.body));
@@ -783,4 +800,148 @@ fn exports_download_says_when_a_file_isnt_an_export_index() {
         .expect("run docspring");
     assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
     assert!(stderr(&output).contains("isn't an account export's index file"), "{}", stderr(&output));
+}
+
+fn support_ticket(base: &str, unread_count: u32) -> Value {
+    let messages = if unread_count == 0 {
+        json!([])
+    } else {
+        json!([{ "id": "smg_1", "author": "team", "body": "Fixed in today's release.", "created_at": "2026-11-17T01:00:00Z", "first_read_at": null }])
+    };
+    json!({
+        "id": "tkt_test",
+        "title": "A checkbox stays empty",
+        "kind": "bug",
+        "category": null,
+        "status": "open",
+        "resolution": null,
+        "impact": null,
+        "task": null,
+        "request_ids": [],
+        "tool": null,
+        "error": null,
+        "suggestion": null,
+        "session": null,
+        "source": "agent",
+        "from_feedback_id": null,
+        "unread_count": unread_count,
+        "watch_url": format!("{base}/api/v2/support/watch/secret"),
+        "notifications": { "email": "j***@example.com", "watch": { "url": format!("{base}/api/v2/support/watch/secret"), "min_interval_seconds": 0, "how": "Poll the URL." } },
+        "notice": "A person on DocSpring's team reads this.",
+        "messages": messages,
+        "created_at": "2026-11-17T00:00:00Z",
+        "updated_at": "2026-11-17T00:00:00Z",
+    })
+}
+
+#[test]
+fn support_watch_waits_on_the_watch_url_without_credentials_and_prints_the_ticket_when_the_team_replies() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let polls = Arc::new(AtomicUsize::new(0));
+    let counted = polls.clone();
+    let server = Server::start(move |request, base| {
+        let watch =
+            |updated_at: &str| json!({ "updated_at": updated_at, "status": "open", "unread_count": 0, "min_interval_seconds": 0, "long_poll": true });
+        if request.path.starts_with("/api/v2/support/watch/secret") {
+            // Nothing new at the first two polls, then the team's reply
+            let state = if counted.fetch_add(1, Ordering::SeqCst) < 2 {
+                watch("2026-11-17T00:00:00Z")
+            } else {
+                watch("2026-11-17T01:00:00Z")
+            };
+            if request.if_none_match == Some(etag(state.to_string().as_bytes())) {
+                return Reply {
+                    status: 304,
+                    body: Vec::new(),
+                };
+            }
+            return Reply::json(200, state);
+        }
+        let replied = counted.load(Ordering::SeqCst) > 2;
+        Reply::json(200, support_ticket(base, u32::from(replied)))
+    });
+
+    let output = with_token(
+        docspring(dir.path()).args(["support", "watch", "tkt_test", "--json", "--timeout", "30"]),
+        &server,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let ticket: Value = serde_json::from_slice(&output.stdout).expect("the ticket as JSON");
+    assert_eq!(ticket["unread_count"], 1);
+    assert_eq!(ticket["messages"][0]["body"], "Fixed in today's release.");
+
+    let requests = server.requests();
+    let watches: Vec<_> = requests.iter().filter(|(_, path, _)| path.contains("/support/watch/")).collect();
+    assert_eq!(watches.len(), 3, "{requests:?}");
+    // The watch URL is its own secret: the API token never goes to it
+    assert!(watches.iter().all(|(_, _, authorization)| authorization.is_none()), "{requests:?}");
+    // The first poll answers at once, and the rest ask the server to hold the request
+    assert!(!watches[0].1.contains("wait="), "{requests:?}");
+    assert!(watches[1].1.ends_with("?wait=30") || watches[1].1.ends_with("?wait=29"), "{requests:?}");
+}
+
+#[test]
+fn support_watch_prints_a_ticket_with_unread_replies_at_once_and_gives_up_at_the_timeout() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let server = Server::start(|_, base| Reply::json(200, support_ticket(base, 1)));
+    let output = with_token(docspring(dir.path()).args(["support", "watch", "tkt_test", "--json"]), &server);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(server.requests().len(), 1);
+
+    let server = Server::start(|request, base| {
+        if !request.path.contains("/support/watch/") {
+            return Reply::json(200, support_ticket(base, 0));
+        }
+        let state =
+            json!({ "updated_at": "2026-11-17T00:00:00Z", "status": "open", "unread_count": 0, "min_interval_seconds": 0, "long_poll": false });
+        if request.if_none_match.is_some() {
+            Reply {
+                status: 304,
+                body: Vec::new(),
+            }
+        } else {
+            Reply::json(200, state)
+        }
+    });
+    let output = with_token(docspring(dir.path()).args(["support", "watch", "tkt_test", "--timeout", "2"]), &server);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(stderr(&output).contains("didn't change in 2 seconds"), "{}", stderr(&output));
+}
+
+#[test]
+fn support_watch_rides_out_a_server_error_while_waiting_and_says_why_when_the_first_poll_fails() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let polls = Arc::new(AtomicUsize::new(0));
+    let counted = polls.clone();
+    let server = Server::start(move |request, base| {
+        if request.path.starts_with("/api/v2/support/watch/secret") {
+            let poll = counted.fetch_add(1, Ordering::SeqCst);
+            // A deploy of the API between the first poll and the team's reply
+            if poll == 1 {
+                return Reply::json(503, json!({ "error": "unavailable" }));
+            }
+            let updated_at = if poll == 0 { "2026-11-17T00:00:00Z" } else { "2026-11-17T01:00:00Z" };
+            return Reply::json(
+                200,
+                json!({ "updated_at": updated_at, "status": "open", "unread_count": 0, "min_interval_seconds": 0, "long_poll": false }),
+            );
+        }
+        Reply::json(200, support_ticket(base, u32::from(counted.load(Ordering::SeqCst) > 2)))
+    });
+    let output = with_token(
+        docspring(dir.path()).args(["support", "watch", "tkt_test", "--json", "--timeout", "30"]),
+        &server,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(polls.load(Ordering::SeqCst), 3);
+
+    let server = Server::start(|request, base| {
+        if request.path.contains("/support/watch/") {
+            return Reply::json(503, json!({ "error": "unavailable" }));
+        }
+        Reply::json(200, support_ticket(base, 0))
+    });
+    let output = with_token(docspring(dir.path()).args(["support", "watch", "tkt_test", "--timeout", "5"]), &server);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(stderr(&output).contains("it answered 503"), "{}", stderr(&output));
 }

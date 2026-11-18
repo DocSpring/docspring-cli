@@ -63,7 +63,8 @@ docspring exports download account_migration_index_mig_1234567890abcdef.json.gz
 `docspring help` lists the commands, and `--help` after any command shows its options. `--json` prints the API's JSON
 response, and the exit status says what went wrong ([Scripts, CI and AI agents](https://docspring.com/docs/cli/#scripts-ci-and-ai-agents)).
 `docspring exports download` saves the account export that DocSpring support sends when you ask for a copy of your
-account's data. The [documentation](https://docspring.com/docs/cli/) has more examples.
+account's data. `docspring support` asks DocSpring's AI help a question, sends feedback and opens support tickets,
+and `docspring support watch` waits for the team's reply to one. The [documentation](https://docspring.com/docs/cli/) has more examples.
 
 ## GitHub Actions
 

@@ -36,6 +36,11 @@ github-attestations = true
 macos-sign = true
 pr-run-mode = "plan"
 
+# dist 0.33.1 builds Apple silicon on macos-14, which GitHub has retired ("The configuration
+# 'macos-14-arm64-us-default' is not supported", CLI 1.1.0's release on 18 Nov 2026). Intel builds use macos-15-intel.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
+
 # A custom publish job gets only id-token and packages unless this says otherwise, and publish-crates.yml checks out
 # the repository; a called workflow can't ask for more than its caller grants. Without an entry, notarize would get
 # the workflow's own contents: write.
